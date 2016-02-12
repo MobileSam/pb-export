@@ -1,0 +1,250 @@
+#!/usr/bin/env node
+'use strict';
+
+process.title = 'pb-export';
+
+var fs = require('fs');
+var crypto = require('crypto');
+
+var read = require('read');
+var request = require('request');
+
+var sjcl = require('../lib/sjcl');
+var t = new Uint32Array(new Uint8Array(t).buffer);
+sjcl.random.addEntropy(t, 1024, "crypto.randomBytes");
+
+read({
+  prompt: 'Please enter your email: ',
+}, function (err, email) {
+  if (err) {
+    return;
+  }
+
+  read({
+    prompt: 'Please enter your password: ',
+    silent: true
+  }, function (err, password) {
+    if (err) {
+      return;
+    }
+
+    start(email, password);
+  });
+});
+
+function start(email, password) {
+  login(email, password, function (err, member) {
+    if (err) {
+      throw err;
+    }
+
+    if (!member.member_key) {
+      throw new Error('Unable to derive your encryption key');
+    }
+
+    getAssets(member, function (err, assets) {
+      if (err) {
+        throw err;
+      }
+
+      createCSV(assets);
+    });
+  });
+}
+
+function login(email, password, callback) {
+  hashPassword(email, password, function (err, hash) {
+    if (err) {
+      return callback(err);
+    }
+
+    var derivedPassword = hash.substr(0, 64);
+
+    request({
+      method: 'POST',
+      url: 'https://api0.passwordbox.com/api/0/api_login.json',
+      form: {
+        member: {
+          email: email,
+          password: derivedPassword
+        }
+      },
+      gzip: true,
+      jar: true,
+      header: {
+        member_id: null
+      }
+    }, function (err, res, data) {
+      if (err) {
+        return callback(err);
+      }
+
+      var member = JSON.parse(data);
+
+      computeKey(member, password, function (err, hash) {
+        member.member_key = hash;
+
+        return callback(undefined, member);
+      });
+    });
+  });
+}
+
+function getAssets(member, callback) {
+  request({
+    method: 'GET',
+    url: 'https://api0.passwordbox.com/api/0/assets',
+    gzip: true,
+    jar: true,
+    header: {
+      member_id: member.id
+    }
+  }, function (err, res, data) {
+    if (err) {
+      callback(err);
+    }
+
+    decryptAssets(JSON.parse(data), member.member_key, callback);
+  });
+}
+
+function createCSV(assets) {
+  var csv = 'name,url,login,password';
+
+  assets.forEach(function (asset) {
+    csv += '\n';
+    csv += [escape(asset.name), escape(asset.url), escape(asset.login), escape(asset.password)].join();
+  });
+
+  fs.writeFile('passwords.csv', csv, function (err) {
+    if (err) {
+      throw err;
+    }
+  });
+}
+
+function escape(string) {
+  if (string.indexOf(',') !== -1 || string.indexOf('"') !== -1 || string.indexOf(' ') !== -1) {
+    return '"' + string.replace('"', '\\"') + '"';
+  }
+
+  return string;
+}
+
+
+function computeKey(member, derivedPassword, callback) {
+  var rules = JSON.parse(member.dr);
+
+  computeDerivedKey(derivedPassword, member.salt, {
+    server_iterations: parseInt(rules.iterations),
+    client_iterations: parseInt(rules.client_iterations)
+  }, function (err, hash) {
+    if (err) {
+      return callback(err);
+    }
+
+    hash = hash.toString('hex').substr(0, 64);
+
+    crypto.pbkdf2(hash + '' + derivedPassword, member.salt, 1, 512, 'sha1', function (err, passphrase) {
+      if (err) {
+        return callback(err);
+      }
+
+      if (!member.k_kek) {
+        return callback(undefined, passphrase);
+      }
+
+      passphrase = passphrase.toString('hex').substr(0, 128);
+      var memberKey = decryptAES(member.k_kek, passphrase, 256);
+
+      return callback(undefined, memberKey);
+    });
+  });
+}
+
+function computeDerivedKey(password, salt, rules, callback) {
+  crypto.pbkdf2(password, salt, 1, 512, 'sha1', function (err, hash) {
+    if (err) {
+      return callback(err);
+    }
+
+    hash = hash.toString('hex').substr(0, 128);
+
+    if (!rules.client_iterations) {
+      return crypto.pbkdf2(hash, salt, rules.server_iterations, 256, 'sha256', callback);
+    }
+
+    return crypto.pbkdf2(hash, salt, rules.client_iterations, 512, 'sha256', function (err, hash) {
+      if (err) {
+        return callback(err);
+      }
+
+      hash = hash.toString('hex').substr(0, 128);
+
+      return crypto.pbkdf2(hash, salt, rules.server_iterations, 256, 'sha256', callback);
+    });
+  });
+}
+
+function decryptAES(ciphertext, password, len) {
+  var n = sjcl.codec.base64.toBits(ciphertext);
+  var l = sjcl.bitArray.extract(n, 8, 8);
+  var encoded, rt, ctxt, mode;
+
+  if (4 > l) {
+    rt = {
+      iv: sjcl.bitArray.clamp(n, 64),
+      compat: "veness"
+    };
+    ctxt = n.slice(2);
+    mode = "ctr";
+  } else {
+    if (l > 4) {
+      throw "invalid cipher format version";
+    }
+
+    if ("string" == typeof password) {
+      password = sjcl.codec.hex.toBits(password);
+    }
+
+    if (sjcl.bitArray.bitLength(password) > 256) {
+      password = sjcl.bitArray.clamp(password, 256);
+    }
+
+    n = sjcl.bitArray.bitSlice(n, 16);
+
+    rt = {
+      iv: sjcl.bitArray.clamp(n, 128)
+    };
+    ctxt = n.slice(4);
+    mode = "ccm";
+  }
+
+  encoded = sjcl.json.encode({
+    mode: mode,
+    ks: len,
+    ct: ctxt
+  });
+
+  return sjcl.decrypt(password, encoded, rt, {});
+}
+
+function decryptAssets(assets, memberKey, callback) {
+  assets.forEach(function (asset) {
+    asset.password = decryptAES(asset.password_k, memberKey, 128);
+  });
+
+  callback(undefined, assets);
+}
+
+function hashPassword(email, password, callback) {
+  var salt = crypto.createHash('sha1').update(email).digest('hex');
+
+  crypto.pbkdf2(password, salt, 1e4, 256, 'sha256', function (err, hash) {
+    if (err) {
+      return callback(err);
+    }
+
+    callback(null, hash.toString('hex'));
+  });
+}

@@ -1,0 +1,25 @@
+{
+  "name": "pb-export",
+  "description": "Export passwords from PasswordBox to a CSV file",
+  "version": "1.0.0",
+  "author": "Samuel Dionne",
+  "repository": "MobileSam/pb-export",
+  "license": "MIT",
+  "engines": {
+    "node": ">=4.2.1"
+  },
+  "scripts": {
+    "start": "node bin/pb-export"
+  },
+  "bin": {
+    "pb-export": "bin/pb-export"
+  },
+  "dependencies": {
+    "read": "^1.0.7",
+    "request": "^2.69.0"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ]
+}
