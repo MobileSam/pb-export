@@ -2,6 +2,10 @@
 
 > PasswordBox export tool.
 
+
+## !! Warning, PasswordBox retired their API so this tool does not work anymore. !!
+
+
 Install this globally and you'll have access to the `pb-export` command anywhere on your system.
 
 ```shell
